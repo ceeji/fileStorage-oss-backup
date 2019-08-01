@@ -49,9 +49,10 @@ func checkErr(err error) {
 
 func initCache(basepath string) {
 	// 打开数据库，如果不存在，则创建
-	db, err := sql.Open("sqlite3", "file:"+filepath.Join(basepath, ".ossIndex.cache.db"))
+	db, err := sql.Open("sqlite3", "file:"+filepath.Join(basepath, ".__ossIndex_special_.cache.dat?cache=shared"))
 	cacheDB = db
 	checkErr(err)
+	db.SetMaxOpenConns(1)
 
 	// 创建表（如果已经创建则忽略错误）
 	sqlTable := `
@@ -91,10 +92,10 @@ func getFileHashInfo(file string, relativePath string, fastMode bool, tx *sql.Tx
 
 	if fastMode {
 		var shaVal string
-		var lastSeenTime int64
-		row := tx.QueryRow("SELECT sha512, lastSeenTime FROM index_cache WHERE path = ? AND modTime = ? AND size = ?", relativePath, resInfo.ModTime, resInfo.Size)
 
-		if row != nil && row.Scan(&shaVal, &lastSeenTime) == nil {
+		row := tx.QueryRow("SELECT sha512 FROM index_cache WHERE path = ? AND modTime = ? AND size = ?", relativePath, resInfo.ModTime, resInfo.Size)
+
+		if row != nil && row.Scan(&shaVal) == nil {
 			resInfo.ChunkKey = shaVal
 
 			_, err = tx.Exec("UPDATE index_cache SET lastSeenTime = ? WHERE path = ? AND modTime = ? AND size = ?", time.Now().UnixNano(), relativePath, resInfo.ModTime, resInfo.Size)
@@ -122,13 +123,13 @@ func getFileHashInfo(file string, relativePath string, fastMode bool, tx *sql.Tx
 	return resInfo, false, nil
 }
 
-func getOSSClient() (client *oss.Client, bucket *oss.Bucket, err error) {
-	client, err = oss.New("oss-cn-beijing.aliyuncs.com", "", "") // oss-cn-hangzhou.aliyuncs.com
+func getOSSClient(conf *userConfig) (client *oss.Client, bucket *oss.Bucket, err error) {
+	client, err = oss.New(conf.Oss.APIPrefix, conf.Oss.OssKey, conf.Oss.OssSecret) // oss-cn-hangzhou.aliyuncs.com
 	if err != nil {
 		return
 	}
 
-	bucket, err = client.Bucket("ceeji-test") // cloudstorage
+	bucket, err = client.Bucket(conf.Oss.BucketName) // cloudstorage
 	return
 }
 
@@ -177,6 +178,7 @@ func checkAndUploadFileToOSS(position int, basepath string, fileHashInfo fileInf
 	}
 
 	fmt.Printf("(%.1f%s Compressed) Uploading...", compressionRatio, "%")
+
 	err := bucket.PutObjectFromFile(fileHashInfo.ChunkKey, compressedFileName)
 	checkErr(err)
 
@@ -209,12 +211,14 @@ func compressFile(filepath string) (tmpPath string, compressedSize int64) {
 }
 
 func uploadIndexFile(indexFilePath string, bucket *oss.Bucket) {
-	fmt.Printf("Uploading Index " + indexFilePath + "...")
+	fmt.Printf("Compressing Index...")
 
-	compressedFileName, _ := compressFile(indexFilePath)
+	compressedFileName, size := compressFile(indexFilePath)
 	defer os.Remove(compressedFileName)
 
-	err := bucket.PutObjectFromFile("indexes/"+filepath.Base(indexFilePath)+".deflate", compressedFileName)
+	fmt.Printf("(%s)...Uploading...", formatFileSize(size))
+
+	err := bucket.PutObjectFromFile("indexes/"+strings.Replace(time.Now().Format("2006-01-02T15_04_05.999999999Z07:00"), ":", "_", 1)+".dat.deflate", compressedFileName)
 	if err != nil {
 		checkErr(err)
 	}
@@ -236,15 +240,57 @@ func formatFileSize(size int64) string {
 	return strconv.FormatFloat(float64(size)/1024/1024/1024, 'f', 1, 64) + " GB"
 }
 
-func makeDirIndex(path string, bucket *oss.Bucket) (indexFilePath string) {
+func processSingleFileScan(conf *userConfig, fullPath string, trx *sql.Tx, writer *bufio.Writer) {
+	fileName := filepath.Base(fullPath)
+
+	// ignore index file
+	if strings.HasPrefix(fileName, ".__ossIndex_special_.") && strings.HasSuffix(fileName, ".dat") {
+		return
+	}
+
+	relativePath, _ := filepath.Rel(conf.FileRootPath, fullPath)
+	relativePath = filepath.ToSlash(relativePath)
+
+	// get hash
+	fileCounter++
+
+	hashInfo, fromCache, err := getFileHashInfo(fullPath, relativePath, true, trx)
+
+	if logLevel == 0 || !fromCache || err != nil || fileCounter%500 == 0 {
+		fmt.Printf("[%d] %s\n", fileCounter, relativePath)
+	}
+	if err != nil {
+		// if some file could not be processed, just ignore it :)
+		fmt.Printf("[Error] File could not be processed: ")
+		fmt.Println(err)
+
+		return
+	}
+
+	jsonRow, _ := json.Marshal(hashInfo)
+	writer.Write(jsonRow)
+	writer.WriteString("\n")
+
+	// add to cache
+	if !fromCache {
+		_, err = trx.Exec("INSERT INTO index_cache (path, modTime, size, sha512, lastSeenTime) VALUES (?, ?, ?, ?, ?)", relativePath, hashInfo.ModTime, hashInfo.Size, hashInfo.ChunkKey, time.Now().UnixNano())
+		checkErr(err)
+	}
+}
+
+func makeDirIndex(conf *userConfig, bucket *oss.Bucket) (indexFilePath string) {
+	path := conf.FileRootPath
 	initCache(path)
 	basePath, _ := filepath.Abs(path)
 	startTime := time.Now()
 
-	fmt.Println("Indexing:" + basePath)
+	fmt.Println("Indexing: " + basePath)
 
-	indexFilePath = filepath.Join(basePath, ".ossIndex."+strings.Replace(time.Now().Format("2006-01-02T15_04_05.999999999Z07:00"), ":", "_", 1)+".dat")
-	fmt.Println("Writing to " + indexFilePath)
+	// 创建临时索引文件
+	indexFile, err := ioutil.TempFile("", "ossIndexTmp")
+	checkErr(err)
+	indexFilePath = indexFile.Name()
+
 	file, err := os.OpenFile(indexFilePath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
 	checkErr(err)
 	defer file.Close()
@@ -258,54 +304,32 @@ func makeDirIndex(path string, bucket *oss.Bucket) (indexFilePath string) {
 	defer trx.Commit()
 	lastFlushTime := time.Now()
 
+	flushFunc := func() {
+		flushStartTime := time.Now()
+		writer.Flush()
+		trx.Commit()
+		trx, err = cacheDB.Begin()
+		checkErr(err)
+
+		// fmt.Println("[Flush] " + time.Since(flushStartTime).String())
+		lastFlushTime = flushStartTime
+	}
+
 	err = godirwalk.Walk(basePath, &godirwalk.Options{
 		Callback: func(fullPath string, f *godirwalk.Dirent) error {
 			if time.Since(lastFlushTime).Seconds() > 5 {
-				flushStartTime := time.Now()
-				writer.Flush()
-				trx.Commit()
-				trx, err = cacheDB.Begin()
-				checkErr(err)
-
-				fmt.Println("[Flush] " + time.Since(flushStartTime).String())
-				lastFlushTime = flushStartTime
+				flushFunc()
 			}
 
-			relativePath, _ := filepath.Rel(basePath, fullPath)
-			relativePath = filepath.ToSlash(relativePath)
-
 			if !f.IsDir() {
-				// get hash
-				fileCounter++
-
-				hashInfo, fromCache, err := getFileHashInfo(fullPath, relativePath, true, trx)
-
-				if logLevel == 0 || !fromCache || err != nil || fileCounter%500 == 0 {
-					fmt.Printf("[%d] %s\n", fileCounter, relativePath)
-				}
-				if err != nil {
-					// if some file could not be processed, just ignore it :)
-					fmt.Printf("[Error] File could not be processed: ")
-					fmt.Println(err)
-
-					return nil
-				}
-
-				jsonRow, _ := json.Marshal(hashInfo)
-				writer.Write(jsonRow)
-				writer.WriteString("\n")
-
-				// add to cache
-				if !fromCache {
-					_, err = trx.Exec("INSERT INTO index_cache (path, modTime, size, sha512, lastSeenTime) VALUES (?, ?, ?, ?, ?)", relativePath, hashInfo.ModTime, hashInfo.Size, hashInfo.ChunkKey, time.Now().UnixNano())
-					checkErr(err)
-				}
+				processSingleFileScan(conf, fullPath, trx, writer)
 			}
 
 			return nil
 		},
 	})
 
+	flushFunc()
 	fmt.Println("Finish indexing in " + time.Since(startTime).String())
 	return
 }
@@ -316,25 +340,40 @@ func uploadChangedFiles(basePath string, indexPath string, bucket *oss.Bucket) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer([]byte{}, bufio.MaxScanTokenSize*10)
 	i := 0
 
 	for scanner.Scan() {
 		// find each file
 		var line fileInfo
-		json.Unmarshal(scanner.Bytes(), &line)
+		bytes := scanner.Bytes()
+
+		if len(bytes) == 0 {
+			continue
+		}
+
+		if err := json.Unmarshal(bytes, &line); err != nil {
+			fmt.Println(scanner.Text())
+			panic(err)
+		}
 
 		// check exsitance on OSS and upload if needed
 		i++
 		checkAndUploadFileToOSS(i, basePath, line, bucket)
 	}
+
+	if err := scanner.Err(); err != nil {
+		panic(err)
+	}
 }
 
 func main() {
-	scanRoot := "D:\\NAS-HOME" // F:\\kindle伴侣同步
+	conf := getConfig()
+	scanRoot := conf.FileRootPath // "F:\\kindle伴侣同步" // "D:\\NAS-HOME"
 
 	fmt.Println("OssArchiveStorageBackup v0.1")
 
-	_, bucket, err := getOSSClient()
+	_, bucket, err := getOSSClient(&conf)
 
 	if err != nil {
 		fmt.Println(err)
@@ -342,7 +381,10 @@ func main() {
 	}
 
 	updateOnlineChunkList(bucket)
-	indexPath := makeDirIndex(scanRoot, bucket)
+
+	indexPath := makeDirIndex(&conf, bucket)
+	defer os.Remove(indexPath)
+
 	uploadIndexFile(indexPath, bucket)
 	uploadChangedFiles(scanRoot, indexPath, bucket)
 }
