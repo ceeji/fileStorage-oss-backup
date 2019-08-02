@@ -38,9 +38,12 @@ func checkConf(conf *userConfig) error {
 	return nil
 }
 
-func getConfig() (config userConfig) {
-	viper.SetConfigName("config") // name of config file (without extension)
-	viper.AddConfigPath(".")      // optionally look for config in the working directory
+func getConfig(configFileName string) (config userConfig) {
+	if configFileName == "" {
+		configFileName = "config"
+	}
+	viper.SetConfigName(configFileName) // name of config file (without extension)
+	viper.AddConfigPath(".")            // optionally look for config in the working directory
 
 	// defaults
 	viper.SetDefault("fileRootPath", "")
@@ -56,7 +59,7 @@ func getConfig() (config userConfig) {
 			if err := viper.WriteConfigAs("./config.yml"); err != nil {
 				panic(err)
 			} else {
-				return getConfig()
+				return getConfig(configFileName)
 			}
 		}
 		panic(fmt.Errorf("Fatal error config file: \n%s", err))

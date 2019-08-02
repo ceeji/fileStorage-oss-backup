@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -20,13 +21,24 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/karrick/godirwalk"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/panjf2000/ants"
 	"gopkg.in/djherbis/times.v1"
 )
+
+const version string = "v0.1"
+
+var fileCounter int
+var onlineChunksSet map[string]bool
+var logLevel int8 = 1 // 0: verbose 1:info 2: none
+var cacheDB *sql.DB
+var sizeToUpload int64
 
 type fileInfo struct {
 	Path         string
@@ -35,11 +47,6 @@ type fileInfo struct {
 	ModTime      int64
 	CreationTime int64
 }
-
-var fileCounter int
-var onlineChunksSet map[string]bool
-var logLevel int8 = 1 // 0: verbose 1:info 2: none
-var cacheDB *sql.DB
 
 func checkErr(err error) {
 	if err != nil {
@@ -156,15 +163,8 @@ func updateOnlineChunkList(bucket *oss.Bucket) error {
 	return nil
 }
 
-func checkAndUploadFileToOSS(position int, basepath string, fileHashInfo fileInfo, bucket *oss.Bucket) {
-	exsits := onlineChunksSet[fileHashInfo.ChunkKey]
-
-	if exsits {
-		return // nothing to do
-	}
-
-	fullPath := filepath.Join(basepath, fileHashInfo.Path)
-	fmt.Printf("[%d / %d] %s (%s)\nCompressing...", position, fileCounter, fileHashInfo.Path, formatFileSize(fileHashInfo.Size))
+func uploadFileToOSS(p *uploadFileParams) {
+	fullPath := filepath.Join(p.basepath, p.fileHashInfo.Path)
 
 	// compress
 	compressedFileName, compressedSize := compressFile(fullPath)
@@ -173,16 +173,14 @@ func checkAndUploadFileToOSS(position int, basepath string, fileHashInfo fileInf
 	// upload
 	var compressionRatio float64
 
-	if fileHashInfo.Size > 0 {
-		compressionRatio = float64(fileHashInfo.Size-compressedSize) / float64(fileHashInfo.Size) * 100
+	if p.fileHashInfo.Size > 0 {
+		compressionRatio = float64(p.fileHashInfo.Size-compressedSize) / float64(p.fileHashInfo.Size) * 100
 	}
 
-	fmt.Printf("(%.1f%s Compressed) Uploading...", compressionRatio, "%")
-
-	err := bucket.PutObjectFromFile(fileHashInfo.ChunkKey, compressedFileName)
+	err := p.bucket.PutObjectFromFile(p.fileHashInfo.ChunkKey, compressedFileName)
 	checkErr(err)
 
-	fmt.Println()
+	fmt.Printf("[%d / %d] %s (%s)\n(%.1f%s Compressed) Uploaded\n", p.position, p.totalCount, p.fileHashInfo.Path, formatFileSize(p.fileHashInfo.Size), compressionRatio, "%")
 }
 
 func compressFile(filepath string) (tmpPath string, compressedSize int64) {
@@ -195,8 +193,8 @@ func compressFile(filepath string) (tmpPath string, compressedSize int64) {
 	tmpFile, err := ioutil.TempFile("", "ossCompTmp")
 	checkErr(err)
 
-	// 创建一个flate.Writer，压缩级别为 2 （偏重速度）
-	flateWrite, err := flate.NewWriter(tmpFile, 2) // -2 ~ 9
+	// 创建一个flate.Writer，压缩级别为 3 （偏重速度）
+	flateWrite, err := flate.NewWriter(tmpFile, 3) // -2 ~ 9
 	checkErr(err)
 	defer flateWrite.Close()
 
@@ -334,51 +332,64 @@ func makeDirIndex(conf *userConfig, bucket *oss.Bucket) (indexFilePath string) {
 	return
 }
 
-func uploadChangedFiles(basePath string, indexPath string, bucket *oss.Bucket) {
-	f, err := os.Open(indexPath)
-	checkErr(err)
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer([]byte{}, bufio.MaxScanTokenSize*10)
-	i := 0
-
-	for scanner.Scan() {
-		// find each file
-		var line fileInfo
-		bytes := scanner.Bytes()
-
-		if len(bytes) == 0 {
-			continue
-		}
-
-		if err := json.Unmarshal(bytes, &line); err != nil {
-			fmt.Println(scanner.Text())
-			panic(err)
-		}
-
-		// check exsitance on OSS and upload if needed
-		i++
-		checkAndUploadFileToOSS(i, basePath, line, bucket)
-	}
-
-	if err := scanner.Err(); err != nil {
-		panic(err)
-	}
+type uploadFileParams struct {
+	position     int
+	basepath     string
+	fileHashInfo *fileInfo
+	bucket       *oss.Bucket
+	totalCount   int
 }
 
-func main() {
-	conf := getConfig()
-	scanRoot := conf.FileRootPath // "F:\\kindle伴侣同步" // "D:\\NAS-HOME"
+func uploadChangedFiles(basePath string, indexPath string, bucket *oss.Bucket) {
+	i := 0
 
-	fmt.Println("OssArchiveStorageBackup v0.1")
+	var wg sync.WaitGroup
 
+	pool, _ := ants.NewPoolWithFunc(12, func(payload interface{}) {
+		params, ok := payload.(*uploadFileParams)
+		if !ok {
+			return
+		}
+		uploadFileToOSS(params)
+		wg.Done()
+	})
+	defer pool.Release()
+
+	// stats
+	countToUpload := 0
+	sizeToUpload = int64(0)
+
+	scanFileJSONLines(indexPath, func(line *fileInfo) {
+		// check exsitance on OSS
+		if !onlineChunksSet[line.ChunkKey] {
+			countToUpload++
+			sizeToUpload += line.Size
+		}
+	})
+
+	scanFileJSONLines(indexPath, func(line *fileInfo) {
+		// check exsitance on OSS
+		if !onlineChunksSet[line.ChunkKey] {
+			i++
+			wg.Add(1)
+			pool.Invoke(&uploadFileParams{
+				position:     i,
+				basepath:     basePath,
+				fileHashInfo: line,
+				bucket:       bucket,
+				totalCount:   countToUpload,
+			})
+		}
+	})
+
+	wg.Wait()
+}
+
+func fullSync(configPath string) {
+	conf := getConfig(configPath)
+	// "F:\\kindle伴侣同步" // "D:\\NAS-HOME"
 	_, bucket, err := getOSSClient(&conf)
-
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
+	checkErr(err)
 
 	updateOnlineChunkList(bucket)
 
@@ -386,5 +397,201 @@ func main() {
 	defer os.Remove(indexPath)
 
 	uploadIndexFile(indexPath, bucket)
-	uploadChangedFiles(scanRoot, indexPath, bucket)
+	uploadChangedFiles(conf.FileRootPath, indexPath, bucket)
+}
+
+func downloadCompressedFile(p *downloadFileParams) (string, int64, error) {
+	os.MkdirAll(filepath.Dir(p.localLocation), 755)
+
+	localFile, err := os.OpenFile(p.localLocation, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0644) // O_EXCL 代表文件必须不存在，存在则报错
+	if err != nil {
+		return "", 0, err
+	}
+	defer localFile.Close()
+
+	// 创建临时文件
+	tmpFile, err := ioutil.TempFile("", "ossDownTmp")
+	checkErr(err)
+	tmpFileName := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpFileName)
+
+	// 下载到该文件
+	if err := p.bucket.GetObjectToFile(p.key, tmpFileName); err != nil {
+		checkErr(err)
+	}
+
+	// 解压文件
+	tmpFile, err = os.Open(tmpFileName)
+	checkErr(err)
+	defer tmpFile.Close()
+
+	flateRead := flate.NewReader(tmpFile)
+	writer := bufio.NewWriter(localFile)
+
+	defer flateRead.Close()
+	io.Copy(writer, flateRead)
+	writer.Flush()
+
+	size, _ := localFile.Seek(0, 1)
+
+	return p.localLocation, size, nil
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `Usage: ossBackup [-r] [-s] [-h] [-t timestamp] [-p restorePath]
+
+Options:
+`)
+	flag.PrintDefaults()
+}
+
+func restoreFiles(configFileName string, path string, time string) {
+	conf := getConfig(configFileName)
+	_, bucket, err := getOSSClient(&conf)
+	checkErr(err)
+
+	fmt.Print("Downloading index...")
+
+	indexFile, err := ioutil.TempFile("", "ossIndexTmp")
+	checkErr(err)
+	indexPath := indexFile.Name()
+	indexFile.Close()
+	os.Remove(indexPath)
+	defer os.Remove(indexPath)
+
+	_, indexSize, err := downloadCompressedFile(&downloadFileParams{
+		bucket:        bucket,
+		key:           "indexes/" + time + ".dat.deflate",
+		localLocation: indexPath,
+	})
+	checkErr(err)
+
+	fmt.Printf("Done (%s)\n", formatFileSize(indexSize))
+
+	downloadAllOSSFilesInIndex(&conf, path, bucket, indexPath)
+}
+
+type downloadFileParams struct {
+	bucket        *oss.Bucket
+	key           string
+	localLocation string
+}
+
+type downloadFileTask struct {
+	downloadParams *downloadFileParams
+	info           *fileInfo
+}
+
+func downloadAllOSSFilesInIndex(conf *userConfig, restoreToPath string, bucket *oss.Bucket, indexPath string) {
+	// 第一遍扫描，确定需要下载的文件数量和总大小
+	var totalCount int32
+	var totalSize int64
+	var downloadedCount int64
+
+	scanFileJSONLines(indexPath, func(line *fileInfo) {
+		totalCount++
+		totalSize += line.Size
+	})
+
+	fmt.Printf("Starting downloading %v files (%v)\n", totalCount, formatFileSize(totalSize))
+
+	var wg sync.WaitGroup
+
+	pool, _ := ants.NewPoolWithFunc(12, func(payload interface{}) {
+		params, ok := payload.(*downloadFileTask)
+		if !ok {
+			return
+		}
+
+		_, size, err := downloadCompressedFile(params.downloadParams)
+
+		atomic.AddInt64(&downloadedCount, params.info.Size)
+		relativePath, _ := filepath.Rel(restoreToPath, params.downloadParams.localLocation)
+
+		if err == nil {
+			os.Chtimes(params.downloadParams.localLocation, time.Unix(0, params.info.ModTime), time.Unix(0, params.info.ModTime))
+			fmt.Printf("(%s / %s) Downloaded %s (%s)\n", formatFileSize(downloadedCount), formatFileSize(totalSize), relativePath, formatFileSize(size))
+		} else {
+			fmt.Printf("(%s / %s) Ignored %s: %v\n", formatFileSize(downloadedCount), formatFileSize(totalSize), relativePath, err)
+		}
+
+		wg.Done()
+	})
+	defer pool.Release()
+
+	// 第二遍扫描，开始下载
+	scanFileJSONLines(indexPath, func(line *fileInfo) {
+		fullPath := filepath.Join(restoreToPath, filepath.FromSlash(line.Path))
+
+		wg.Add(1)
+		pool.Invoke(&downloadFileTask{
+			downloadParams: &downloadFileParams{
+				bucket, line.ChunkKey, fullPath,
+			},
+			info: line,
+		})
+	})
+
+	wg.Wait()
+}
+
+func scanFileJSONLines(path string, processer func(line *fileInfo)) {
+	f, err := os.Open(path)
+	checkErr(err)
+	defer f.Close()
+
+	reader := bufio.NewReaderSize(f, 10240)
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer([]byte{}, bufio.MaxScanTokenSize*10)
+
+	for scanner.Scan() {
+		bytes := scanner.Bytes()
+
+		var line fileInfo
+
+		if err := json.Unmarshal(bytes, &line); err != nil {
+			fmt.Println(scanner.Text())
+			panic(err)
+		}
+
+		processer(&line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		checkErr(err)
+	}
+}
+
+func parseCmd() {
+	var restore bool
+	var sync bool
+	var help bool
+	var time string
+	var path string
+	var configFileName string
+	flag.BoolVar(&restore, "r", false, "restore files from OSS")
+	flag.BoolVar(&sync, "s", false, "sync files to OSS")
+	flag.BoolVar(&help, "h", false, "show help and exit")
+	flag.StringVar(&time, "t", "", "the timestamp for restoring files (like 2019-08-02T02_44_44.7450746+08_00)")
+	flag.StringVar(&path, "p", "", "the path for restoring files (required for restoring)")
+	flag.StringVar(&configFileName, "c", "", "the name of config file")
+
+	// 改变默认的 Usage
+	flag.Usage = usage
+
+	flag.Parse() // Scans the arg list and sets up flags
+
+	if sync {
+		fullSync(configFileName)
+	} else if restore && path != "" && time != "" {
+		restoreFiles(configFileName, path, time)
+	} else {
+		flag.Usage()
+	}
+}
+
+func main() {
+	fmt.Println("OssArchiveStorageBackup " + version)
+	parseCmd()
 }
